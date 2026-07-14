@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Flight Path Simulator — Slingshot Prototype</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b1020; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { background: #0b1020; display: block; image-rendering: pixelated; }
+  #wrap { display: flex; flex-direction: column; align-items: center; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1000" height="620"></canvas>
+</div>
+<script>
+'use strict';
+
+// ============================================================
+// FLIGHT PATH CALCULATOR — Interactive Slingshot Prototype (JS port)
+// Ported 1:1 from the Python/pygame version. Pure HTML5 Canvas — no
+// build step, no dependencies. Just host this file.
+//
+// Controls:
+//   Click + hold + drag the rocket, then release  -> launch (slingshot)
+//   W/Up, S/Down (hold, mid-flight)  -> thrust forward / backward (ship-relative)
+//   A/Left, D/Right (hold, mid-flight) -> strafe left / right (ship-relative)
+//   R                                 -> reset / try again
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 1000, H = 620;
+
+// ---------------- WORLD / PHYSICS CONSTANTS ----------------
+const EARTH_POS = [150, 480];
+const BASE_MARS_POS = [520, 240];
+const BASE_TARGET_POS = [860, 420];
+
+const MARS_VISUAL_RADIUS = 26;
+const CRASH_RADIUS = 46;       // red ring: a danger zone, NOT instant death — gravity/debris here
+                                // pulls hard toward Mars; you have to fight it with thrust
+const ACTUAL_CRASH_RADIUS = MARS_VISUAL_RADIUS;  // black outline: touching this is a real crash
+const DANGER_ZONE_FORCE_MULT = 5.0;  // extra gravity multiplier inside the red zone, scaling
+                                      // up to this much stronger as you approach the black outline
+const INFLUENCE_RADIUS = 260;
+const CAPTURE_RADIUS = 50;
+const G_MARS = 350000;
+
+// Gravitational softening — prevents the 1/dist^2 term from spiking
+// toward infinity at very close range (e.g. right at launch/re-launch).
+const GRAVITY_SOFTENING = 40.0;
+
+const MIN_PULL = 18;
+const MAX_PULL = 170;
+const MIN_LAUNCH_SPEED = 14;
+const MAX_LAUNCH_SPEED = 62;
+
+const BOOST_RAMP_SECONDS = 2.4;
+const LIFTOFF_SPEED_FRAC = 0.10;
+
+const MARS_TARGET_JITTER = 45;
+const MIN_MARS_TARGET_SEP = CRASH_RADIUS + CAPTURE_RADIUS + 90;
+const MIN_MARS_EARTH_SEP = INFLUENCE_RADIUS * 0.62;
+const MIN_TARGET_EARTH_SEP = 250;
+
+const HOURS_PER_SECOND = 85;
+const FUEL_LAUNCH_BURN_FRAC = 0.30;
+const FUEL_DRAIN_OVER_60S = 0.35;
+const OPS_COST_PER_SECOND = 450;
+const MAX_MISSION_TIME = 200;
+const RECOVERY_FRACTION = 0.35;
+
+const MANUAL_THRUST_ACCEL = 55.0;
+const MANUAL_FUEL_DRAIN_MULT = 9.0;
+const MANUAL_BATTERY_DRAIN_MULT = 5.0;
+
+const EVENT_CHANCE_PER_FRAME = 0.0024;
+const EVENT_KICK_BASE = 14.0;
+const EVENT_KICK_SCALE = 220.0;
+const ALERT_GRACE_PERIOD = 8.0;
+const MANUAL_CORRECTION_HOLD = 0.5;
+const UNRESOLVED_EVENT_RISK_PENALTY = 0.09;
+
+const G0 = 9.81;
+
+const RANDOM_EVENTS = [
+  ["Solar flare / radiation spike", 0.08],
+  ["Micrometeoroid strike", 0.10],
+  ["Communication blackout", 0.04],
+  ["Navigation/sensor fault", 0.07],
+  ["Thermal system anomaly", 0.05],
+  ["Engine misfire", 0.09],
+  ["Guidance computer glitch", 0.06],
+  ["Debris field encounter", 0.08],
+  ["Reaction wheel stall", 0.06],
+  ["Cosmic ray bit-flip", 0.05],
+];
+
+// ---------------- BASELINE MISSION CALCULATIONS ----------------
+function fuelRequired(deltaV, isp, dryMass) {
+  const exhaustVelocity = isp * G0;
+  const massRatio = Math.exp(deltaV / exhaustVelocity);
+  const wetMass = dryMass * massRatio;
+  const propellantMass = wetMass - dryMass;
+  return { propellantMass, wetMass };
+}
+function batteryRequired(missionHours, avgPowerDrawW, safetyMargin = 1.3) {
+  const energyWh = missionHours * avgPowerDrawW * safetyMargin;
+  return energyWh;
+}
+function baseHardwareCost(dryMass, propellantMass) {
+  return dryMass * 25000 + propellantMass * 40;
+}
+
+function hypot(x, y) { return Math.sqrt(x * x + y * y); }
+function randRange(a, b) { return a + Math.random() * (b - a); }
+function choice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+// ============================================================
+// GAME
+// ============================================================
+class SlingshotGame {
+  constructor() {
+    this.dryMass = 1200;
+    this.isp = 320;
+    this.avgPowerDraw = 350;
+    this.nominalDeltaV = 9000;
+    const { propellantMass, wetMass } = fuelRequired(this.nominalDeltaV, this.isp, this.dryMass);
+    this.propellantTotal = propellantMass;
+    this.wetMass = wetMass;
+    this.batteryTotalWh = batteryRequired(4400, this.avgPowerDraw);
+    this.hardwareCost = baseHardwareCost(this.dryMass, this.propellantTotal);
+
+    // starfield
+    this.stars = [];
+    for (let i = 0; i < 170; i++) {
+      this.stars.push([Math.random() * W, Math.random() * H, 1 + Math.random() * 1.6]);
+    }
+
+    this.keys = {};
+    this.dragging = false;
+    this.dragMouse = null;
+
+    this.reset();
+    this._bindInput();
+  }
+
+  pickPositions() {
+    for (let i = 0; i < 300; i++) {
+      const mars = [
+        BASE_MARS_POS[0] + randRange(-MARS_TARGET_JITTER, MARS_TARGET_JITTER),
+        BASE_MARS_POS[1] + randRange(-MARS_TARGET_JITTER, MARS_TARGET_JITTER),
+      ];
+      const target = [
+        BASE_TARGET_POS[0] + randRange(-MARS_TARGET_JITTER, MARS_TARGET_JITTER),
+        BASE_TARGET_POS[1] + randRange(-MARS_TARGET_JITTER, MARS_TARGET_JITTER),
+      ];
+      const dMarsTarget = hypot(mars[0] - target[0], mars[1] - target[1]);
+      const dMarsEarth = hypot(mars[0] - EARTH_POS[0], mars[1] - EARTH_POS[1]);
+      const dTargetEarth = hypot(target[0] - EARTH_POS[0], target[1] - EARTH_POS[1]);
+      if (dMarsTarget > MIN_MARS_TARGET_SEP && dMarsEarth > MIN_MARS_EARTH_SEP && dTargetEarth > MIN_TARGET_EARTH_SEP) {
+        return [mars, target];
+      }
+    }
+    return [BASE_MARS_POS.slice(), BASE_TARGET_POS.slice()];
+  }
+
+  reset() {
+    this.state = "aim";          // aim | flight | crashed | lost | returned
+    this.leg = "outbound";       // outbound | return
+    const [mars, target] = this.pickPositions();
+    this.marsPos = mars;
+    this.targetPos = target;
+
+    this.pos = EARTH_POS.slice();
+    this.vel = [0, 0];
+    this.speedCurrent = 0;
+    this.headingDeg = -90;
+    this.dragging = false;
+    this.dragMouse = null;
+    this.elapsed = 0;
+    this.fuelRemaining = this.propellantTotal;
+    this.batteryRemaining = this.batteryTotalWh;
+    this.costCurrent = this.hardwareCost;
+    this.riskCurrent = 0.15;
+    this.eventLog = [];              // [text, life]
+    this.activeEventImpacts = [];    // [impact, life]
+    this.trail = [];
+    this.minMarsDistThisFlight = 1e9;
+    this.recoverySavings = 0;
+
+    this.launchDir = [0, 0];
+    this.launchTargetSpeed = 0;
+    this.launchFuelBudget = 0;
+    this.boostElapsed = 0;
+    this.boostDuration = 0;
+
+    this.manualActive = false;
+    this.manualWhUsed = 0;
+    this.manualAlert = null;
+    this.unresolvedPenalty = 0;
+    this.outOfResources = false;
+
+    this.finalScore = null;   // computed once, when the mission ends
+    this.scoreBreakdown = null;
+  }
+
+  _bindInput() {
+    window.addEventListener('keydown', (e) => {
+      this.keys[e.key.toLowerCase()] = true;
+      if (e.key === 'r' || e.key === 'R') this.reset();
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+    });
+    window.addEventListener('keyup', (e) => { this.keys[e.key.toLowerCase()] = false; });
+
+    const getMousePos = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = W / rect.width, scaleY = H / rect.height;
+      return [(e.clientX - rect.left) * scaleX, (e.clientY - rect.top) * scaleY];
+    };
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (this.state !== 'aim' || this.outOfResources) return;
+      const [mx, my] = getMousePos(e);
+      if (hypot(mx - this.pos[0], my - this.pos[1]) < 55) {
+        this.dragging = true;
+        this.dragMouse = [mx, my];
+      }
+    });
+    canvas.addEventListener('mousemove', (e) => {
+      if (this.dragging) this.dragMouse = getMousePos(e);
+    });
+    window.addEventListener('mouseup', (e) => {
+      if (this.dragging) {
+        this.dragging = false;
+        const [mx, my] = getMousePos(e);
+        this.tryLaunch([mx, my]);
+      }
+    });
+    // touch support
+    canvas.addEventListener('touchstart', (e) => {
+      if (this.state !== 'aim' || this.outOfResources) return;
+      const t = e.touches[0];
+      const [mx, my] = getMousePos(t);
+      if (hypot(mx - this.pos[0], my - this.pos[1]) < 65) {
+        this.dragging = true;
+        this.dragMouse = [mx, my];
+        e.preventDefault();
+      }
+    }, { passive: false });
+    canvas.addEventListener('touchmove', (e) => {
+      if (this.dragging) { this.dragMouse = getMousePos(e.touches[0]); e.preventDefault(); }
+    }, { passive: false });
+    canvas.addEventListener('touchend', (e) => {
+      if (this.dragging) {
+        this.dragging = false;
+        this.tryLaunch(this.dragMouse);
+      }
+    });
+  }
+
+  launchParams(mousePos) {
+    const pullVec = [this.pos[0] - mousePos[0], this.pos[1] - mousePos[1]];
+    const pullLen = hypot(pullVec[0], pullVec[1]);
+    if (pullLen < MIN_PULL) return null;
+    const pullLenClamped = Math.min(pullLen, MAX_PULL);
+    const speed = MIN_LAUNCH_SPEED + (pullLenClamped - MIN_PULL) / (MAX_PULL - MIN_PULL) * (MAX_LAUNCH_SPEED - MIN_LAUNCH_SPEED);
+    const ux = pullVec[0] / pullLen, uy = pullVec[1] / pullLen;
+    const powerFrac = (speed - MIN_LAUNCH_SPEED) / (MAX_LAUNCH_SPEED - MIN_LAUNCH_SPEED);
+    const boostDuration = BOOST_RAMP_SECONDS * (0.75 + 0.5 * powerFrac);
+    const fuelBudget = this.propellantTotal * FUEL_LAUNCH_BURN_FRAC * (0.4 + 0.6 * powerFrac);
+    return { dir: [ux, uy], targetSpeed: speed, boostDuration, fuelBudget };
+  }
+
+  tryLaunch(mousePos) {
+    if (this.fuelRemaining <= 0 || this.batteryRemaining <= 0) return;
+    const params = this.launchParams(mousePos);
+    if (!params) return;
+
+    const [ux, uy] = params.dir;
+    const speed = params.targetSpeed;
+    this.launchDir = [ux, uy];
+    this.launchTargetSpeed = speed;
+    this.boostDuration = params.boostDuration;
+    this.boostElapsed = 0;
+    this.vel = [ux * speed * LIFTOFF_SPEED_FRAC, uy * speed * LIFTOFF_SPEED_FRAC];
+    this.launchFuelBudget = params.fuelBudget;
+
+    this.state = "flight";
+    if (this.leg === "outbound") {
+      this.elapsed = 0;
+      this.trail = [this.pos.slice()];
+    } else {
+      this.trail.push(this.pos.slice());
+    }
+  }
+
+  // Returns { pos, vel, dist, status }
+  simulateStep(pos, vel, dt, targetPos, captureRadius = CAPTURE_RADIUS) {
+    const dx = this.marsPos[0] - pos[0];
+    const dy = this.marsPos[1] - pos[1];
+    const dist = hypot(dx, dy);
+    if (dist < ACTUAL_CRASH_RADIUS) return { pos, vel, dist, status: "crashed" };
+
+    let nvel = [vel[0], vel[1]];
+    if (dist < INFLUENCE_RADIUS) {
+      const safeDist = Math.max(dist, GRAVITY_SOFTENING);
+      let accel = G_MARS / (safeDist * safeDist);
+      if (dist < CRASH_RADIUS) {
+        // inside the red danger zone: gravity/debris pulls hard toward the
+        // black outline — the closer you get, the stronger the pull, so
+        // escaping takes real thrust and fuel
+        const dangerFrac = (CRASH_RADIUS - dist) / (CRASH_RADIUS - ACTUAL_CRASH_RADIUS);
+        accel *= (1 + DANGER_ZONE_FORCE_MULT * dangerFrac);
+      }
+      nvel[0] += accel * dx / safeDist * dt;
+      nvel[1] += accel * dy / safeDist * dt;
+    }
+
+    const npos = [pos[0] + nvel[0] * dt, pos[1] + nvel[1] * dt];
+    const tdx = targetPos[0] - npos[0], tdy = targetPos[1] - npos[1];
+    if (hypot(tdx, tdy) < captureRadius) return { pos: npos, vel: nvel, dist, status: "success" };
+    if (npos[0] < -250 || npos[0] > W + 250 || npos[1] < -250 || npos[1] > H + 250) {
+      return { pos: npos, vel: nvel, dist, status: "lost" };
+    }
+    return { pos: npos, vel: nvel, dist, status: "flying" };
+  }
+
+  previewPath(mousePos) {
+    const params = this.launchParams(mousePos);
+    if (!params) return { pts: [], outcome: null };
+
+    const [ux, uy] = params.dir;
+    const speed = params.targetSpeed;
+    const boostDuration = params.boostDuration;
+    const outbound = this.leg === "outbound";
+    const targetPos = outbound ? this.targetPos : EARTH_POS;
+    const targetVisualRadius = outbound ? 26 : 24;  // matches the drawn black-outline radius
+
+    let pos = this.pos.slice();
+    let vel = [ux * speed * LIFTOFF_SPEED_FRAC, uy * speed * LIFTOFF_SPEED_FRAC];
+    let boostElapsed = 0;
+    const dt = 1 / 60;
+    const thrustAccel = speed / boostDuration;
+
+    const pts = [];
+    let outcome = "flying";
+    for (let i = 0; i < 7800; i++) {
+      if (boostElapsed < boostDuration) {
+        vel[0] += ux * thrustAccel * dt;
+        vel[1] += uy * thrustAccel * dt;
+        boostElapsed += dt;
+      }
+      const step = this.simulateStep(pos, vel, dt, targetPos, targetVisualRadius);
+      pos = step.pos; vel = step.vel; outcome = step.status;
+      if (i % 4 === 0) pts.push([pos[0], pos[1]]);
+      if (outcome === "crashed" || outcome === "success" || outcome === "lost") {
+        pts.push([pos[0], pos[1]]);
+        break;
+      }
+    }
+    return { pts, outcome };
+  }
+
+  manualThrustDirection() {
+    const k = this.keys;
+    const forward = (k['arrowup'] || k['w'] ? 1 : 0) - (k['arrowdown'] || k['s'] ? 1 : 0);
+    const strafe = (k['arrowright'] || k['d'] ? 1 : 0) - (k['arrowleft'] || k['a'] ? 1 : 0);
+    if (forward === 0 && strafe === 0) return null;
+    const theta = this.headingDeg * Math.PI / 180;
+    const fx = Math.cos(theta), fy = Math.sin(theta);
+    const rx = -Math.sin(theta), ry = Math.cos(theta);
+    let dx = forward * fx + strafe * rx;
+    let dy = forward * fy + strafe * ry;
+    const dlen = hypot(dx, dy);
+    if (dlen < 1e-6) return null;
+    return [dx / dlen, dy / dlen];
+  }
+
+  update(dt) {
+    if (this.state !== "flight") {
+      this.manualActive = false;
+      this.outOfResources = this.fuelRemaining <= 0 || this.batteryRemaining <= 0;
+      return;
+    }
+
+    this.elapsed += dt;
+    const resourcesAvailable = this.fuelRemaining > 0 && this.batteryRemaining > 0;
+    this.outOfResources = !resourcesAvailable;
+
+    if (resourcesAvailable && this.boostElapsed < this.boostDuration) {
+      const thrustAccel = this.launchTargetSpeed / this.boostDuration;
+      this.vel[0] += this.launchDir[0] * thrustAccel * dt;
+      this.vel[1] += this.launchDir[1] * thrustAccel * dt;
+      const burn = this.launchFuelBudget * (dt / this.boostDuration);
+      this.fuelRemaining = Math.max(0, this.fuelRemaining - burn);
+      this.boostElapsed += dt;
+    }
+
+    const manualDir = resourcesAvailable ? this.manualThrustDirection() : null;
+    this.manualActive = manualDir !== null;
+    if (this.manualActive) {
+      this.vel[0] += manualDir[0] * MANUAL_THRUST_ACCEL * dt;
+      this.vel[1] += manualDir[1] * MANUAL_THRUST_ACCEL * dt;
+    }
+
+    const outboundLeg = this.leg === "outbound";
+    const targetPos = outboundLeg ? this.targetPos : EARTH_POS;
+    const targetVisualRadius = outboundLeg ? 26 : 24;  // matches the drawn black outline
+    const step = this.simulateStep(this.pos, this.vel, dt, targetPos, targetVisualRadius);
+    this.pos = step.pos; this.vel = step.vel;
+    const distToMars = step.dist, status = step.status;
+
+    this.speedCurrent = hypot(this.vel[0], this.vel[1]);
+    if (this.speedCurrent > 1.0) {
+      this.headingDeg = Math.atan2(this.vel[1], this.vel[0]) * 180 / Math.PI;
+    }
+    this.minMarsDistThisFlight = Math.min(this.minMarsDistThisFlight, distToMars);
+    this.trail.push(this.pos.slice());
+    if (this.trail.length > 6000) this.trail.shift();
+
+    // battery drain
+    const missionHoursElapsed = this.elapsed * HOURS_PER_SECOND;
+    const usedWh = missionHoursElapsed * this.avgPowerDraw;
+    if (this.manualActive) {
+      const passiveWhPerSec = this.avgPowerDraw * HOURS_PER_SECOND;
+      this.manualWhUsed += passiveWhPerSec * (MANUAL_BATTERY_DRAIN_MULT - 1.0) * dt;
+    }
+    this.batteryRemaining = Math.max(0, this.batteryTotalWh - usedWh - this.manualWhUsed);
+
+    // fuel drain
+    const drainMult = this.manualActive ? MANUAL_FUEL_DRAIN_MULT : 1.0;
+    const drainRate = this.propellantTotal * FUEL_DRAIN_OVER_60S / 60.0 * drainMult;
+    this.fuelRemaining = Math.max(0, this.fuelRemaining - drainRate * dt);
+
+    // random events
+    if (this.manualAlert === null && Math.random() < EVENT_CHANCE_PER_FRAME) {
+      const [name, impact] = choice(RANDOM_EVENTS);
+      const kickAngle = randRange(0, 2 * Math.PI);
+      const kickMag = EVENT_KICK_BASE + impact * EVENT_KICK_SCALE;
+      this.vel[0] += Math.cos(kickAngle) * kickMag;
+      this.vel[1] += Math.sin(kickAngle) * kickMag;
+      this.manualAlert = { name, timer: ALERT_GRACE_PERIOD, correction: 0 };
+      this.eventLog.push([`! ${name} — knocked off course!`, 5.0]);
+      this.activeEventImpacts.push([impact, 6.0]);
+    }
+
+    if (this.manualAlert !== null) {
+      if (this.manualActive) {
+        this.manualAlert.correction += dt;
+        if (this.manualAlert.correction >= MANUAL_CORRECTION_HOLD) {
+          this.eventLog.push([`\u2713 ${this.manualAlert.name} corrected — back on course.`, 3.5]);
+          this.manualAlert = null;
+        }
+      }
+      if (this.manualAlert !== null) {
+        this.manualAlert.timer -= dt;
+        if (this.manualAlert.timer <= 0) {
+          this.unresolvedPenalty += UNRESOLVED_EVENT_RISK_PENALTY;
+          this.eventLog.push([`\u2717 ${this.manualAlert.name} went uncorrected — risk up.`, 4.0]);
+          this.manualAlert = null;
+        }
+      }
+    }
+
+    this.eventLog = this.eventLog.map(([t, life]) => [t, life - dt]).filter(([, life]) => life > 0);
+    this.activeEventImpacts = this.activeEventImpacts.map(([imp, life]) => [imp, life - dt]).filter(([, life]) => life > 0);
+    const eventRisk = this.activeEventImpacts.reduce((sum, [imp, life]) => sum + imp * (life / 6.0), 0);
+
+    let proximityRisk = 0;
+    if (distToMars < INFLUENCE_RADIUS) {
+      proximityRisk = Math.max(0, (INFLUENCE_RADIUS - distToMars) / (INFLUENCE_RADIUS - CRASH_RADIUS)) * 0.4;
+    }
+    const durationRisk = Math.min(this.elapsed / 90.0, 1.0) * 0.2;
+    this.riskCurrent = Math.min(1.0, 0.15 + proximityRisk + durationRisk + eventRisk + this.unresolvedPenalty);
+
+    const fuelUsed = this.propellantTotal - this.fuelRemaining;
+    const fuelCost = fuelUsed * 40;
+    const opsCost = this.elapsed * OPS_COST_PER_SECOND;
+    const riskPremium = (this.hardwareCost + fuelCost) * (this.riskCurrent * 0.3);
+    this.costCurrent = this.hardwareCost + fuelCost + opsCost + riskPremium;
+
+    if (this.elapsed > MAX_MISSION_TIME) {
+      this.state = "lost";
+      this.finalScore = this.computeScore();
+      return;
+    }
+
+    if (status !== "flying") {
+      if (status === "success" && this.leg === "outbound") {
+        this.leg = "return";
+        this.state = "aim";
+        this.vel = [0, 0];
+        this.eventLog.push(["Target reached! Slingshot back to Earth to save money.", 6.0]);
+      } else if (status === "success" && this.leg === "return") {
+        const recovery = this.hardwareCost * RECOVERY_FRACTION;
+        this.recoverySavings = recovery;
+        this.costCurrent = Math.max(0, this.costCurrent - recovery);
+        this.state = "returned";
+        this.finalScore = this.computeScore();
+      } else {
+        this.state = status;  // "crashed" or "lost"
+        this.finalScore = this.computeScore();
+      }
+    }
+  }
+
+  // ---------------- SCORING ----------------
+  // Combines: mission outcome, total cost, risk taken, time elapsed, and
+  // leftover resources (rewards efficient, low-risk, well-fueled missions).
+  computeScore() {
+    let outcomePoints = 0;
+    if (this.state === "returned") outcomePoints = 1000;      // full round trip
+    else if (this.state === "lost") outcomePoints = 150;      // survived, but drifted off
+    else if (this.state === "crashed") outcomePoints = 0;     // mission failure
+
+    const costPenalty = this.costCurrent / 300000;
+    const riskPenalty = this.riskCurrent * 400;
+    const timePenalty = this.elapsed * 1.0;
+
+    const fuelFrac = this.propellantTotal > 0 ? this.fuelRemaining / this.propellantTotal : 0;
+    const batteryFrac = this.batteryTotalWh > 0 ? this.batteryRemaining / this.batteryTotalWh : 0;
+    const resourceBonus = fuelFrac * 150 + batteryFrac * 150;
+
+    const raw = outcomePoints - costPenalty - riskPenalty - timePenalty + resourceBonus;
+    const total = Math.max(0, Math.round(raw));
+
+    this.scoreBreakdown = {
+      outcomePoints, costPenalty, riskPenalty, timePenalty, resourceBonus, total,
+    };
+    return total;
+  }
+
+  // ---------------- DRAWING ----------------
+  drawGlowCircle(pos, radius, color, label) {
+    const grad = ctx.createRadialGradient(pos[0], pos[1], 0, pos[0], pos[1], radius * 1.8);
+    grad.addColorStop(0, `rgba(${color[0]},${color[1]},${color[2]},0.27)`);
+    grad.addColorStop(1, `rgba(${color[0]},${color[1]},${color[2]},0)`);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(pos[0], pos[1], radius * 1.8, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(pos[0], pos[1], radius, 0, Math.PI * 2);
+    ctx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgb(10,10,10)';
+    ctx.stroke();
+
+    if (label) {
+      ctx.fillStyle = 'rgb(235,235,235)';
+      ctx.font = '14px Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(label, pos[0], pos[1] + radius + 18);
+    }
+  }
+
+  drawRocket(pos, headingDeg) {
+    const size = 13;
+    const theta = headingDeg * Math.PI / 180;
+    const tip = [pos[0] + size * Math.cos(theta), pos[1] + size * Math.sin(theta)];
+    const left = [pos[0] + size * 0.55 * Math.cos(theta + 2.6), pos[1] + size * 0.55 * Math.sin(theta + 2.6)];
+    const right = [pos[0] + size * 0.55 * Math.cos(theta - 2.6), pos[1] + size * 0.55 * Math.sin(theta - 2.6)];
+    ctx.beginPath();
+    ctx.moveTo(tip[0], tip[1]);
+    ctx.lineTo(left[0], left[1]);
+    ctx.lineTo(right[0], right[1]);
+    ctx.closePath();
+    ctx.fillStyle = 'rgb(235,235,235)';
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgb(20,20,20)';
+    ctx.stroke();
+
+    if (this.state === 'flight') {
+      const flameLen = size * (0.6 + Math.random() * 0.5);
+      const back = [pos[0] - flameLen * Math.cos(theta), pos[1] - flameLen * Math.sin(theta)];
+      ctx.beginPath();
+      ctx.moveTo(pos[0], pos[1]);
+      ctx.lineTo(back[0], back[1]);
+      ctx.strokeStyle = 'rgb(255,150,30)';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+  }
+
+  draw() {
+    ctx.fillStyle = 'rgb(11,16,32)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = 'white';
+    for (const [sx, sy, r] of this.stars) {
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Mars influence ring — the zone where gravity bends your path (safe, informative)
+    ctx.save();
+    const ringGrad = ctx.createRadialGradient(this.marsPos[0], this.marsPos[1], 0, this.marsPos[0], this.marsPos[1], INFLUENCE_RADIUS);
+    ringGrad.addColorStop(0, 'rgba(224,122,63,0.03)');
+    ringGrad.addColorStop(0.85, 'rgba(224,122,63,0.10)');
+    ringGrad.addColorStop(1, 'rgba(224,122,63,0.16)');
+    ctx.fillStyle = ringGrad;
+    ctx.beginPath();
+    ctx.arc(this.marsPos[0], this.marsPos[1], INFLUENCE_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.setLineDash([6, 6]);
+    ctx.strokeStyle = 'rgba(224,122,63,0.75)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+
+    // Mars crash-radius ring — the actual danger zone, drawn distinctly
+    // from the influence ring above so it can't be mistaken for it
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(this.marsPos[0], this.marsPos[1], CRASH_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(230,60,60,0.18)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(230,60,60,0.9)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+
+    const earthLabel = this.leg === 'outbound' ? 'Earth' : 'Earth (return home!)';
+    this.drawGlowCircle(EARTH_POS, 24, [59, 130, 246], earthLabel);
+    this.drawGlowCircle(this.marsPos, MARS_VISUAL_RADIUS, [224, 122, 63], 'Mars');
+    const targetColor = this.leg === 'outbound' ? [192, 57, 43] : [90, 90, 90];
+    this.drawGlowCircle(this.targetPos, 26, targetColor, 'Target');
+
+
+    // trail
+    if (this.trail.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(this.trail[0][0], this.trail[0][1]);
+      for (let i = 1; i < this.trail.length; i++) ctx.lineTo(this.trail[i][0], this.trail[i][1]);
+      ctx.strokeStyle = 'rgb(127,209,255)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // aim rubber band + preview
+    if (this.state === 'aim' && this.dragging && this.dragMouse) {
+      ctx.beginPath();
+      ctx.moveTo(this.pos[0], this.pos[1]);
+      ctx.lineTo(this.dragMouse[0], this.dragMouse[1]);
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      const { pts, outcome } = this.previewPath(this.dragMouse);
+      const colorMap = {
+        success: 'rgb(0,230,120)', crashed: 'rgb(230,60,60)',
+        lost: 'rgb(150,150,150)', flying: 'rgb(200,200,60)',
+      };
+      ctx.fillStyle = colorMap[outcome] || 'rgb(200,200,60)';
+      for (const p of pts) {
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    this.drawRocket(this.pos, this.headingDeg);
+    this.drawHud();
+    this.drawAlertBanner();
+    this.drawEndBanner();
+  }
+
+  manualStatusText() {
+    if (this.outOfResources) return "UNAVAILABLE (out of fuel/power — adrift)";
+    if (this.manualActive) return "ON (burning extra fuel/power)";
+    return "off";
+  }
+
+  drawHud() {
+    const speedKms = this.speedCurrent * 0.18;
+    const lines = [
+      "MISSION STATS (live)",
+      `State:        ${this.state.toUpperCase()}`,
+      `Leg:          ${this.leg.toUpperCase()}`,
+      `Elapsed:      ${this.elapsed.toFixed(1)} s`,
+      `Velocity:     ${this.speedCurrent.toFixed(1)} u/s  (~${speedKms.toFixed(1)} km/s)`,
+      `Fuel:         ${Math.round(this.fuelRemaining).toLocaleString()} kg`,
+      `Battery:      ${Math.round(this.batteryRemaining).toLocaleString()} Wh`,
+      `Risk score:   ${this.riskCurrent.toFixed(2)}`,
+      `Est. cost:    $${Math.round(this.costCurrent).toLocaleString()}`,
+      `Manual ctrl:  ${this.manualStatusText()}`,
+    ];
+    if (this.recoverySavings > 0) {
+      lines.push(`Recovered:    $${Math.round(this.recoverySavings).toLocaleString()} saved!`);
+    }
+
+    const panelW = 320;
+    const panelH = 22 * lines.length + 18;
+    ctx.fillStyle = 'rgba(20,26,48,0.84)';
+    roundRect(ctx, W - panelW - 15, 15, panelW, panelH, 10);
+    ctx.fill();
+
+    ctx.font = '13px Consolas, monospace';
+    ctx.textAlign = 'left';
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let col = i === 0 ? '#fff' : '#e1e1e1';
+      if (line.startsWith('Recovered')) col = 'rgb(0,230,120)';
+      if (line.startsWith('Manual ctrl') && this.manualActive) col = 'rgb(255,190,60)';
+      if (line.startsWith('Manual ctrl') && this.outOfResources) col = 'rgb(230,70,70)';
+      ctx.fillStyle = col;
+      ctx.fillText(line, W - panelW, 22 + i * 22 + 10);
+    }
+
+    ctx.font = 'bold 18px Consolas, monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Flight Path Simulator — Slingshot Prototype', 15, 30);
+
+    ctx.font = '13px Consolas, monospace';
+    if (this.state === 'aim') {
+      let hint;
+      if (this.outOfResources) hint = "Out of fuel/power — engines are dead, the rocket can no longer maneuver";
+      else if (this.leg === 'outbound') hint = "Click + drag the rocket back, then release to launch toward the Target";
+      else hint = "Target reached! Drag + release again to slingshot back to Earth and save money";
+      ctx.fillStyle = 'rgb(200,200,200)';
+      ctx.fillText(hint, 15, H - 15);
+    } else if (this.state === 'flight') {
+      let hint;
+      if (this.outOfResources) hint = "Out of fuel/power — adrift on momentum and gravity alone, no thrust available";
+      else hint = "W/Up S/Down: forward/back thrust · A/Left D/Right: strafe — relative to the nose";
+      ctx.fillStyle = 'rgb(200,200,200)';
+      ctx.fillText(hint, 15, H - 15);
+    }
+
+    const recent = this.eventLog.slice(-4);
+    for (let i = 0; i < recent.length; i++) {
+      const [text, life] = recent[i];
+      const alpha = Math.max(0, Math.min(1, life / 4.0));
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = 'rgb(255,210,60)';
+      ctx.fillText(text, 15, 60 + i * 20);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  drawAlertBanner() {
+    if (this.manualAlert === null) return;
+    const flashOn = Math.floor(performance.now() / 260) % 2 === 0;
+    const color = flashOn ? 'rgb(255,90,60)' : 'rgb(255,190,60)';
+    const timerLeft = Math.max(0, this.manualAlert.timer);
+    const text = `\u26A0 ${this.manualAlert.name.toUpperCase()} — HOLD WASD/ARROWS TO CORRECT (${timerLeft.toFixed(1)}s)`;
+    ctx.font = 'bold 18px Consolas, monospace';
+    const textW = ctx.measureText(text).width;
+    const boxW = textW + 40, boxH = 44;
+    ctx.fillStyle = 'rgba(30,10,10,0.82)';
+    roundRect(ctx, W / 2 - boxW / 2, 20, boxW, boxH, 10);
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    roundRect(ctx, W / 2 - boxW / 2, 20, boxW, boxH, 10);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.fillText(text, W / 2, 20 + boxH / 2 + 6);
+    ctx.textAlign = 'left';
+  }
+
+  drawEndBanner() {
+    const messages = {
+      crashed: ["MISSION FAILED — Crashed into Mars", 'rgb(230,60,60)'],
+      lost: ["MISSION FAILED — Lost in space", 'rgb(200,200,200)'],
+      returned: ["MISSION SUCCESS — Round trip complete!", 'rgb(0,230,120)'],
+    };
+    if (!messages[this.state]) return;
+
+    // dim the scene behind the summary panel
+    ctx.fillStyle = 'rgba(5,7,16,0.72)';
+    ctx.fillRect(0, 0, W, H);
+
+    const [titleText, titleColor] = messages[this.state];
+
+    const panelW = 460;
+    const panelH = 340;
+    const px = W / 2 - panelW / 2;
+    const py = H / 2 - panelH / 2;
+
+    ctx.fillStyle = 'rgba(20,26,48,0.96)';
+    roundRect(ctx, px, py, panelW, panelH, 14);
+    ctx.fill();
+    ctx.strokeStyle = titleColor;
+    ctx.lineWidth = 2;
+    roundRect(ctx, px, py, panelW, panelH, 14);
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 24px Consolas, monospace';
+    ctx.fillStyle = titleColor;
+    ctx.fillText(titleText, W / 2, py + 42);
+
+    const fuelFrac = this.propellantTotal > 0 ? this.fuelRemaining / this.propellantTotal : 0;
+    const batteryFrac = this.batteryTotalWh > 0 ? this.batteryRemaining / this.batteryTotalWh : 0;
+    if (this.finalScore === null) this.finalScore = this.computeScore();
+
+    const rows = [
+      ["Total money spent", `$${Math.round(this.costCurrent).toLocaleString()}`],
+      ["  (recovered on return)", this.recoverySavings > 0 ? `-$${Math.round(this.recoverySavings).toLocaleString()} saved` : "n/a"],
+      ["Fuel remaining", `${Math.round(this.fuelRemaining).toLocaleString()} kg  (${Math.round(fuelFrac * 100)}%)`],
+      ["Battery remaining", `${Math.round(this.batteryRemaining).toLocaleString()} Wh  (${Math.round(batteryFrac * 100)}%)`],
+      ["Risk score", this.riskCurrent.toFixed(2)],
+      ["Elapsed time", `${this.elapsed.toFixed(1)} s`],
+    ];
+
+    ctx.textAlign = 'left';
+    ctx.font = '14px Consolas, monospace';
+    let ry = py + 78;
+    for (const [label, value] of rows) {
+      ctx.fillStyle = 'rgb(180,185,200)';
+      ctx.fillText(label, px + 28, ry);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = 'rgb(230,230,230)';
+      ctx.fillText(value, px + panelW - 28, ry);
+      ctx.textAlign = 'left';
+      ry += 26;
+    }
+
+    // divider
+    ry += 6;
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(px + 28, ry);
+    ctx.lineTo(px + panelW - 28, ry);
+    ctx.stroke();
+    ry += 34;
+
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 32px Consolas, monospace';
+    const scoreColor = this.finalScore >= 700 ? 'rgb(0,230,120)'
+      : this.finalScore >= 350 ? 'rgb(255,190,60)'
+      : 'rgb(230,90,90)';
+    ctx.fillStyle = scoreColor;
+    ctx.fillText(`FINAL SCORE: ${this.finalScore}`, W / 2, ry);
+
+    ctx.font = '13px Consolas, monospace';
+    ctx.fillStyle = 'rgb(160,165,180)';
+    ctx.fillText("Press R to fly again", W / 2, ry + 30);
+    ctx.textAlign = 'left';
+  }
+
+  loop(tsMs) {
+    if (this._lastTs === undefined) this._lastTs = tsMs;
+    let dt = (tsMs - this._lastTs) / 1000;
+    this._lastTs = tsMs;
+    dt = Math.min(dt, 1 / 30); // clamp to avoid huge jumps on tab-switch
+
+    this.update(dt);
+    this.draw();
+
+    requestAnimationFrame(this.loop.bind(this));
+  }
+
+  start() {
+    requestAnimationFrame(this.loop.bind(this));
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+const game = new SlingshotGame();
+game.start();
+</script>
+</body>
+</html>
